@@ -1,0 +1,18 @@
+empty: Length=0 IsDefault=False IsEmpty=True
+names: 3 alpha,beta,gamma IsDefault=False
+  alpha
+  beta
+  gamma
+sum=15 evens=2,4 [2]=3
+spreadArray: 0,10,20,30
+spreadEnumerable: 0,2,4,6,-1
+spreadImmutable: 10 1,2,3,4,5,0,10,20,30,99
+onlySpread: Length=0 IsDefault=False
+points: Point { X = 1, Y = 2 } Point { X = 3, Y = 4 } sumX=4
+people: Person { Name = Bob, Age = 42 } oldest=Bob
+  a=1
+  b=2
+pairs[1].Key=b
+mixed: x|alpha|beta|gamma|z contains beta: True
+built: 6 last=6 original=5
+select: 1,4,9,16,25

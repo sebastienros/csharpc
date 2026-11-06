@@ -1,0 +1,18 @@
+ImmutableList: 3 a,b,c
+empty ImmutableList: 0 same=True
+ImmutableHashSet: 2 x=True z=False
+empty ImmutableHashSet: 0
+Bag.Create(3)
+Bag: 3 builder 1,2,3
+Bag.Create(5)
+spread Bag: 1,2,3,4,5
+Bag.Create(0)
+empty Bag: 0
+IntRow: 3 total=12
+empty IntRow: 0
+generic: head,T1,T2
+List from ImmutableArray: 7,8,9
+array from ImmutableArray: 0,7,8
+span with spreads: 25
+JsonArray: 3 [1,"two",null]
+empty JsonArray: 0 []

@@ -874,6 +874,9 @@ public sealed partial class FunctionCodeGen
     private LLVMValueRef EmitCollectionExpression(ICollectionExpressionOperation collection)
     {
         if (TypeMapper.IsSpan(TypeOf(collection))) return SpanFromCollection(collection, SpanElement(TypeOf(collection)!));
+        // [CollectionBuilder(typeof(B), "Create")] types (ImmutableArray<T>, ImmutableList<T>, user types): the
+        // builder method receives the elements as a ReadOnlySpan<T>.
+        if (collection.ConstructMethod is { IsStatic: true } builder) return CollectionViaBuilder(collection, S(builder));
         var target = TypeOf(collection);
         if (target is INamedTypeSymbol { TypeKind: TypeKind.Interface, TypeArguments.Length: 1 } itf)
         {
@@ -887,28 +890,88 @@ public sealed partial class FunctionCodeGen
         if (target is INamedTypeSymbol { TypeKind: TypeKind.Class } collectionClass) return CollectionViaAdd(collection, collectionClass);
         if (target is not IArrayTypeSymbol { Rank: 1 } arrayType)
             throw CompileError.Unsupported($"collection expression of type '{collection.Type}'", collection);
+        return CollectionArray(collection, arrayType.ElementType);
+    }
+
+    /// <summary>The elements of a collection expression in a fresh T[] (spreads: a List&lt;T&gt;, then ToArray()).</summary>
+    private LLVMValueRef CollectionArray(ICollectionExpressionOperation collection, ITypeSymbol elementType)
+    {
         if (collection.Elements.Any(e => e is ISpreadOperation))
         {
-            // Spreads: build a List<T>, then ToArray().
-            var listType = (INamedTypeSymbol)_m.CoreLib.Map(_m.Compilation.GetTypeByMetadataName("System.Collections.Generic.List`1")!.Construct(arrayType.ElementType));
+            var listType = (INamedTypeSymbol)_m.CoreLib.Map(_m.Compilation.GetTypeByMetadataName("System.Collections.Generic.List`1")!.Construct(elementType));
             var list = CollectionViaAdd(collection, listType);
             var toArray = listType.GetMembers("ToArray").OfType<IMethodSymbol>().First(m => m.Parameters.IsEmpty);
             return DirectCall(toArray, [list]);
         }
-        var array = NewArray(arrayType.ElementType, L.ConstInt(L.I64, collection.Elements.Length));
-        StoreElements(array, arrayType.ElementType, collection.Elements);
+        var array = NewArray(elementType, L.ConstInt(L.I64, collection.Elements.Length));
+        StoreElements(array, elementType, collection.Elements);
         return array;
+    }
+
+    /// <summary>
+    /// The collection-builder pattern: `B.Create(ReadOnlySpan&lt;T&gt;)` over the elements. The span views a GC array,
+    /// so it stays valid whatever the builder does with it. ImmutableArray&lt;T&gt; with elements wraps that array
+    /// directly, as csc does (ImmutableCollectionsMarshal.AsImmutableArray): the array is never visible elsewhere, so
+    /// the builder's defensive copy would be wasted; `[]` still goes through Create, which returns
+    /// ImmutableArray&lt;T&gt;.Empty (not a default array).
+    /// </summary>
+    private LLVMValueRef CollectionViaBuilder(ICollectionExpressionOperation collection, IMethodSymbol builder)
+    {
+        if (builder.Parameters is not [{ RefKind: RefKind.None } spanParameter] || !TypeMapper.IsSpan(S(spanParameter.Type)))
+            throw CompileError.Unsupported($"collection builder '{builder}'", collection);
+        var spanType = S(spanParameter.Type);
+        var element = SpanElement(spanType);
+        var target = TypeOf(collection)!;
+        if (!collection.Elements.IsEmpty && target is INamedTypeSymbol { IsValueType: true } immutable
+            && immutable is { MetadataName: "ImmutableArray`1", ContainingType: null }
+            && immutable.ContainingNamespace.ToDisplayString() == "System.Collections.Immutable"
+            && SymbolEqualityComparer.Default.Equals(immutable.TypeArguments[0], element)
+            && immutable.GetMembers().OfType<IFieldSymbol>().Where(f => !f.IsStatic).ToArray() is [{ Type: IArrayTypeSymbol { Rank: 1 } } field])
+        {
+            var wrapped = NewTemp(T.Value(immutable), "immutable.array");
+            _b.Store(LlvmContext.Null(T.Value(immutable)), wrapped);
+            StoreValue(ToStorage(CollectionArray(collection, element), field.Type), FieldAddressOn(wrapped, field));
+            return _b.Load(T.Value(immutable), wrapped);
+        }
+        LLVMValueRef span;
+        if (collection.Elements.IsEmpty) span = LlvmContext.Null(SpanType);
+        else
+        {
+            var array = CollectionArray(collection, element);
+            var header = T.ArrayHeader(T.Storage(element));
+            span = MakeSpan(_b.StructGep(header, array, 2), _b.Cast(LLVMOpcode.Trunc, LoadArrayLength(array), L.I32));
+        }
+        return Coerce(DirectCall(builder, [span]), S(builder.ReturnType), target);
     }
 
     /// <summary>`List&lt;T&gt; l = [a, ..xs, b]`: new T() then Add / AddRange-style loops for spreads.</summary>
     private LLVMValueRef CollectionViaAdd(ICollectionExpressionOperation collection, INamedTypeSymbol type)
     {
-        var ctor = type.InstanceConstructors.FirstOrDefault(c => c.Parameters.IsEmpty)
+        // The constructor Roslyn bound (callable without arguments: `JsonArray(JsonNodeOptions? options = null)`), or,
+        // for an IList<T>/ICollection<T> target lowered to List<T>, its parameterless one.
+        var ctor = (collection.ConstructMethod is { MethodKind: MethodKind.Constructor } bound
+                && SymbolEqualityComparer.Default.Equals(S(bound).ContainingType, type) ? S(bound) : null)
+            ?? type.InstanceConstructors.FirstOrDefault(c => c.Parameters.IsEmpty)
             ?? throw CompileError.Unsupported($"collection expression of type '{type}' (no parameterless constructor)", collection);
-        var add = type.GetMembers("Add").OfType<IMethodSymbol>().FirstOrDefault(m => m.Parameters.Length == 1 && !m.IsStatic);
+        var ctorArgs = new LLVMValueRef[1 + ctor.Parameters.Length];
+        foreach (var parameter in ctor.Parameters)
+        {
+            var parameterType = S(parameter.Type);
+            ctorArgs[1 + parameter.Ordinal] = parameter switch
+            {
+                { IsParams: true, Type: IArrayTypeSymbol paramsArray } => NewArray(S(paramsArray.ElementType), L.ConstInt(L.I64, 0)),
+                { HasExplicitDefaultValue: true, ExplicitDefaultValue: null } => LlvmContext.Null(T.Value(parameterType)),
+                { HasExplicitDefaultValue: true } when !TypeMapper.IsNullable(parameterType) => Constant(parameter.ExplicitDefaultValue, parameterType, collection),
+                _ => throw CompileError.Unsupported($"collection expression of type '{type}' (constructor '{ctor}')", collection),
+            };
+        }
+        // The element-typed Add(T) (JsonArray also has a generic Add<T>(T value), which the elements don't bind to here).
+        var add = type.GetMembers("Add").OfType<IMethodSymbol>().Where(m => m.Parameters.Length == 1 && !m.IsStatic)
+            .OrderBy(m => m.IsGenericMethod).FirstOrDefault();
         var layout = _m.GetLayout(type);
         var obj = Allocate(layout.MethodTable, L.ConstInt(L.I64, (long)layout.InstanceSize));
-        DirectCall(ctor, [obj]);
+        ctorArgs[0] = obj;
+        DirectCall(ctor, ctorArgs);
         if (collection.Elements.IsEmpty) return obj; // `Dictionary<K, V> d = [];` needs no Add(T)
         if (add is null) throw CompileError.Unsupported($"collection expression of type '{type}' (no Add method)", collection);
         var elementType = S(add.Parameters[0].Type);
@@ -919,10 +982,13 @@ public sealed partial class FunctionCodeGen
                 if (TypeOf(spread.Operand) is not IArrayTypeSymbol { Rank: 1 } spreadArray)
                 {
                     // Any other enumerable reference type: AddRange(IEnumerable<T>) on the target.
+                    // A struct enumerable (ImmutableArray<T>, ...) is boxed to the interface, as the conversion would.
                     var addRange = type.GetMembers("AddRange").OfType<IMethodSymbol>().FirstOrDefault(m => m.Parameters.Length == 1 && !m.IsStatic);
-                    if (addRange is null || TypeOf(spread.Operand) is not { IsReferenceType: true })
-                        throw CompileError.Unsupported($"spreading '{TypeOf(spread.Operand)}' into '{type}'", spread);
-                    var enumerable = EmitValue(spread.Operand);
+                    var operandType = TypeOf(spread.Operand);
+                    if (addRange is null || operandType is null || operandType.TypeKind == TypeKind.TypeParameter
+                        || !_m.Compilation.HasImplicitConversion(operandType, S(addRange.Parameters[0].Type)))
+                        throw CompileError.Unsupported($"spreading '{operandType}' into '{type}'", spread);
+                    var enumerable = operandType.IsValueType ? Box(EmitValue(spread.Operand), operandType, spread) : EmitValue(spread.Operand);
                     DirectCall(addRange, [obj, enumerable]);
                     continue;
                 }

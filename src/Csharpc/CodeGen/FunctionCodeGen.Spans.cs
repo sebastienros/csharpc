@@ -137,11 +137,11 @@ public sealed partial class FunctionCodeGen
     /// <summary>Collection expressions targeting spans: backed by a fresh GC array (safe for any span lifetime).</summary>
     private LLVMValueRef SpanFromCollection(ICollectionExpressionOperation collection, ITypeSymbol element)
     {
-        if (collection.Elements.Any(e => e is ISpreadOperation)) throw CompileError.Unsupported("spread elements", collection);
-        var array = NewArray(element, L.ConstInt(L.I64, collection.Elements.Length));
-        StoreElements(array, element, collection.Elements);
+        var array = CollectionArray(collection, element);
         var header = T.ArrayHeader(T.Storage(element));
-        return MakeSpan(_b.StructGep(header, array, 2), L.ConstInt(L.I32, collection.Elements.Length));
+        var length = collection.Elements.Any(e => e is ISpreadOperation)
+            ? _b.Cast(LLVMOpcode.Trunc, LoadArrayLength(array), L.I32) : L.ConstInt(L.I32, collection.Elements.Length);
+        return MakeSpan(_b.StructGep(header, array, 2), length);
     }
 
     private LLVMValueRef EmitUtf8String(IUtf8StringOperation op) => EmitUtf8Text(op.Value);
